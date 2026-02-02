@@ -3,7 +3,8 @@ import { AnalyticsSession, Registry } from './durable_object';
 export interface Env {
   ANALYTICS_SESSION: DurableObjectNamespace;
   REGISTRY: DurableObjectNamespace;
-  SHARD_CONFIG: string; // JSON String of URLs
+  SHARD_CONFIG: string; 
+  MAIN_SHARD_URL: string;
 }
 
 export { AnalyticsSession, Registry };
@@ -20,22 +21,13 @@ export default {
       return stub.fetch(request);
     }
 
-    // API 2: Connection & Identity Locking
-    if (path === '/connect' && request.method === 'POST') {
+    // API 2 & 3: Connection & Tracking (using analytics_id only)
+    if ((path === '/connect' || path === '/track') && request.method === 'POST') {
       const body = await request.clone().json() as any;
-      if (!body.user_id) return new Response('Missing user_id', { status: 400 });
+      if (!body.analytics_id) return new Response('Missing analytics_id', { status: 400 });
       
-      const id = env.ANALYTICS_SESSION.idFromName(body.user_id.toString());
-      const stub = env.ANALYTICS_SESSION.get(id);
-      return stub.fetch(request);
-    }
-
-    // API 3: Batched Event Tracking
-    if (path === '/track' && request.method === 'POST') {
-      const body = await request.clone().json() as any;
-      if (!body.user_id) return new Response('Missing user_id', { status: 400 });
-
-      const id = env.ANALYTICS_SESSION.idFromName(body.user_id.toString());
+      // Use analytics_id as the unique key for the Durable Object
+      const id = env.ANALYTICS_SESSION.idFromName(body.analytics_id);
       const stub = env.ANALYTICS_SESSION.get(id);
       return stub.fetch(request);
     }
