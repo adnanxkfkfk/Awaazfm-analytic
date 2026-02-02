@@ -13,26 +13,27 @@ export class Registry {
   async fetch(request: Request): Promise<Response> {
     const statsUrl = `${this.env.MAIN_SHARD_URL}/system_stats.json`;
     
-    // Debug: Log the config we parsed
+    // Parse Config safely
     let shardUrls: string[] = [];
     try {
         shardUrls = JSON.parse(this.env.SHARD_CONFIG);
     } catch (e) {
-        return new Response(JSON.stringify({ error: "Config Parse Failed" }), { status: 500 });
+        shardUrls = []; // Fallback
     }
     
-    // Fetch stats
+    // 1. Get Stats (Main Shard)
     let stats: any = {};
     try {
         stats = await (await fetch(statsUrl)).json() as any;
-    } catch (e) { /* ignore network error for now */ }
+    } catch (e) {}
 
     if (!stats) stats = { total_users: 0 };
     const userId = (stats.total_users || 0) + 1;
     
+    // 2. Load Balancing
     const shardIndex = userId % (shardUrls.length || 1);
     const uniquePart = crypto.randomUUID();
-    const analyticsId = `${shardIndex}.${uniquePart}`;
+    const analyticsId = `${shardIndex}.${uniquePart}`; // 0.uuid
     const safeId = uniquePart;
 
     const userRecord = {
@@ -41,21 +42,23 @@ export class Registry {
       created_at: Date.now()
     };
     
-    // Write to Main Shard
-    const mapResult = await fetch(`${this.env.MAIN_SHARD_URL}/identity_map/${safeId}.json`, {
+    // 3. Write Metadata (Main Shard)
+    // Async execution (Fire & Forget for speed)
+    const mapPromise = fetch(`${this.env.MAIN_SHARD_URL}/identity_map/${safeId}.json`, {
       method: 'PUT',
       body: JSON.stringify(userRecord)
     });
 
-    await fetch(statsUrl, {
+    const statsPromise = fetch(statsUrl, {
       method: 'PATCH',
       body: JSON.stringify({ total_users: userId })
     });
 
+    await Promise.all([mapPromise, statsPromise]);
+
     return new Response(JSON.stringify({
       analytics_id: analyticsId,
-      debug_config_len: shardUrls.length,
-      debug_main_shard_status: mapResult.status
+      metadata: { region: 'global' }
     }), { headers: { 'Content-Type': 'application/json' } });
   }
 }
@@ -97,16 +100,12 @@ export class AnalyticsSession {
         this.buffer.push(...events);
       }
       
-      let flushDebug = null;
-      // Force flush if we have events, for debugging purposes
-      if (this.buffer.length >= 1) { 
-        flushDebug = await this.flush();
+      // Production Flush: Threshold = 5
+      if (this.buffer.length >= 5) { 
+        await this.flush();
       }
       
-      return new Response(JSON.stringify({ 
-          queued: events.length,
-          debug_flush: flushDebug 
-      }));
+      return new Response(JSON.stringify({ queued: events.length }));
     }
 
     if (url.pathname === '/connect') {
@@ -127,37 +126,24 @@ export class AnalyticsSession {
 
   async flush() {
     const targetUrlRoot = this.getShardUrl();
-    
-    // Debug info return
-    if (!this.analyticsId) return { error: "No Analytics ID" };
-    if (!targetUrlRoot) return { error: "No Shard URL Found", config_len: this.shardConfig.length, id: this.analyticsId };
-    if (this.buffer.length === 0) return { status: "Buffer Empty" };
+    if (this.buffer.length === 0 || !targetUrlRoot || !this.analyticsId) return;
 
     const eventsPayload = [...this.buffer];
-    this.buffer = []; // Clear buffer BEFORE fetch to prevent duplicates if logic fails later, but for debug maybe keep if fail? No, standard is clear.
+    this.buffer = []; 
 
     const timestamp = Date.now();
+    // Sanitize: . -> _
     const safeAnalyticsId = this.analyticsId.replace(/\./g, '_');
     const targetUrl = `${targetUrlRoot}/events/${safeAnalyticsId}/${timestamp}.json`;
 
     try {
-      const response = await fetch(targetUrl, {
+      await fetch(targetUrl, {
         method: 'PUT',
         body: JSON.stringify(eventsPayload),
         headers: { 'Content-Type': 'application/json' }
       });
-      
-      const responseText = await response.text();
-      
-      return {
-          status: response.status,
-          statusText: response.statusText,
-          url: targetUrl,
-          response_body: responseText
-      };
-
-    } catch (e: any) {
-      return { error: "Fetch Exception", details: e.message, url: targetUrl };
+    } catch (e) {
+      console.error("Flush Failed", e);
     }
   }
 }
