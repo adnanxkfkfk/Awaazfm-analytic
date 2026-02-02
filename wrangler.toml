@@ -15,9 +15,14 @@ tag = "v1"
 new_sqlite_classes = ["AnalyticsSession", "Registry"]
 
 [vars]
+# THE CONTROL PLANE
+# Only for User ID mapping, Shard Assignment, and System Stats. No analytics events.
+MAIN_SHARD_URL = "https://awaaz-anl-default-rtdb.asia-southeast1.firebasedatabase.app"
+
+# THE DATA PLANE (Data Shards)
+# High-volume analytics storage.
 SHARD_CONFIG = """
 [
-  "https://comstorytv-default-rtdb.firebaseio.com",
   "https://awaazfm-shard-2-default-rtdb.firebaseio.com",
   "https://awaazfm-shard-3-default-rtdb.firebaseio.com"
 ]
