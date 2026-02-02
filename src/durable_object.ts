@@ -12,28 +12,17 @@ export class Registry {
 
   async fetch(request: Request): Promise<Response> {
     const statsUrl = `${this.env.MAIN_SHARD_URL}/system_stats.json`;
-    
-    // Parse Config safely
-    let shardUrls: string[] = [];
-    try {
-        shardUrls = JSON.parse(this.env.SHARD_CONFIG);
-    } catch (e) {
-        shardUrls = []; // Fallback
-    }
-    
-    // 1. Get Stats (Main Shard)
     let stats: any = {};
-    try {
-        stats = await (await fetch(statsUrl)).json() as any;
-    } catch (e) {}
-
+    try { stats = await (await fetch(statsUrl)).json() as any; } catch (e) {}
     if (!stats) stats = { total_users: 0 };
-    const userId = (stats.total_users || 0) + 1;
     
-    // 2. Load Balancing
+    const userId = (stats.total_users || 0) + 1;
+    let shardUrls: string[] = [];
+    try { shardUrls = JSON.parse(this.env.SHARD_CONFIG); } catch (e) {}
+    
     const shardIndex = userId % (shardUrls.length || 1);
     const uniquePart = crypto.randomUUID();
-    const analyticsId = `${shardIndex}.${uniquePart}`; // 0.uuid
+    const analyticsId = `${shardIndex}.${uniquePart}`;
     const safeId = uniquePart;
 
     const userRecord = {
@@ -42,19 +31,14 @@ export class Registry {
       created_at: Date.now()
     };
     
-    // 3. Write Metadata (Main Shard)
-    // Async execution (Fire & Forget for speed)
-    const mapPromise = fetch(`${this.env.MAIN_SHARD_URL}/identity_map/${safeId}.json`, {
+    fetch(`${this.env.MAIN_SHARD_URL}/identity_map/${safeId}.json`, {
       method: 'PUT',
       body: JSON.stringify(userRecord)
     });
-
-    const statsPromise = fetch(statsUrl, {
+    fetch(statsUrl, {
       method: 'PATCH',
       body: JSON.stringify({ total_users: userId })
     });
-
-    await Promise.all([mapPromise, statsPromise]);
 
     return new Response(JSON.stringify({
       analytics_id: analyticsId,
@@ -63,7 +47,7 @@ export class Registry {
   }
 }
 
-// --- DATA PLANE: ANALYTICS SESSION DO ---
+// --- DATA PLANE: ANALYTICS SESSION DO (WebSocket Edition) ---
 export class AnalyticsSession {
   state: DurableObjectState;
   env: Env;
@@ -71,6 +55,7 @@ export class AnalyticsSession {
   analyticsId: string | null = null;
   shardConfig: string[] = [];
   buffer: any[] = [];
+  sessions: WebSocket[] = [];
 
   constructor(state: DurableObjectState, env: Env) {
     this.state = state;
@@ -78,7 +63,7 @@ export class AnalyticsSession {
     try {
       this.shardConfig = JSON.parse(env.SHARD_CONFIG);
     } catch (e) {}
-
+    
     this.state.blockConcurrencyWhile(async () => {
         this.analyticsId = await this.state.storage.get<string>('analytics_id');
     });
@@ -86,33 +71,65 @@ export class AnalyticsSession {
 
   async fetch(request: Request): Promise<Response> {
     const url = new URL(request.url);
-    const body = await request.clone().json() as any;
-    const providedId = body.analytics_id;
 
-    if (providedId && !this.analyticsId) {
-       this.analyticsId = providedId;
-       await this.state.storage.put('analytics_id', providedId);
-    }
-
-    if (url.pathname === '/track') {
-      const { events } = body;
-      if (Array.isArray(events)) {
-        this.buffer.push(...events);
+    if (url.pathname === '/analytics') {
+      if (request.headers.get('Upgrade') !== 'websocket') {
+        return new Response('Expected websocket', { status: 426 });
       }
-      
-      // Production Flush: Threshold = 5
-      if (this.buffer.length >= 5) { 
-        await this.flush();
-      }
-      
-      return new Response(JSON.stringify({ queued: events.length }));
-    }
 
-    if (url.pathname === '/connect') {
-      return new Response(JSON.stringify({ status: 'connected' }));
+      const providedId = url.searchParams.get('analytics_id');
+      if (providedId && !this.analyticsId) {
+        this.analyticsId = providedId;
+        await this.state.storage.put('analytics_id', providedId);
+      }
+
+      // Create WebSocket Pair
+      const { 0: client, 1: server } = new WebSocketPair();
+      this.handleSession(server);
+
+      return new Response(null, { status: 101, webSocket: client });
     }
 
     return new Response('Not Found', { status: 404 });
+  }
+
+  handleSession(webSocket: WebSocket) {
+    this.sessions.push(webSocket);
+    
+    // Accept the connection
+    webSocket.accept();
+
+    webSocket.addEventListener('message', async (event) => {
+      try {
+        const raw = event.data;
+        if (typeof raw !== 'string') return;
+        const msg = JSON.parse(raw);
+
+        // Expecting { events: [...] } or single event object
+        // For simplicity: We expect { events: [...] }
+        if (msg.events && Array.isArray(msg.events)) {
+            this.buffer.push(...msg.events);
+        } else {
+            // Treat whole message as one event if needed, or ignore
+            // ignoring malformed for now
+        }
+
+        // Flush Threshold
+        if (this.buffer.length >= 5) {
+            await this.flush();
+        }
+
+      } catch (err) {
+        // webSocket.send(JSON.stringify({ error: 'Parse Error' }));
+      }
+    });
+
+    webSocket.addEventListener('close', async () => {
+      // Remove from session list
+      this.sessions = this.sessions.filter(s => s !== webSocket);
+      // Flush on disconnect
+      await this.flush();
+    });
   }
 
   getShardUrl(): string | null {
@@ -129,10 +146,9 @@ export class AnalyticsSession {
     if (this.buffer.length === 0 || !targetUrlRoot || !this.analyticsId) return;
 
     const eventsPayload = [...this.buffer];
-    this.buffer = []; 
+    this.buffer = [];
 
     const timestamp = Date.now();
-    // Sanitize: . -> _
     const safeAnalyticsId = this.analyticsId.replace(/\./g, '_');
     const targetUrl = `${targetUrlRoot}/events/${safeAnalyticsId}/${timestamp}.json`;
 
@@ -142,8 +158,10 @@ export class AnalyticsSession {
         body: JSON.stringify(eventsPayload),
         headers: { 'Content-Type': 'application/json' }
       });
+      // Optional: Ack to client?
     } catch (e) {
       console.error("Flush Failed", e);
+      // Put back in buffer? Or drop. Dropping to prevent memory leaks in DO.
     }
   }
 }
