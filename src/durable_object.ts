@@ -1,131 +1,156 @@
 import { Env } from './index';
 
-// --- REGISTRY DO (Monotonic ID Generation) ---
+// --- CONTROL PLANE: REGISTRY DO ---
 export class Registry {
   state: DurableObjectState;
-  constructor(state: DurableObjectState) {
+  env: Env;
+
+  constructor(state: DurableObjectState, env: Env) {
     this.state = state;
+    this.env = env;
   }
 
   async fetch(request: Request): Promise<Response> {
-    let lastId = (await this.state.storage.get<number>('last_id')) || 1000;
-    lastId++;
-    await this.state.storage.put('last_id', lastId);
-
-    // Calculate logical shard (1 bucket = 1000 users)
-    const logicalShardId = Math.ceil(lastId / 1000);
+    const statsUrl = `${this.env.MAIN_SHARD_URL}/system_stats.json`;
     
+    // 1. Get Global User Count (for stats only)
+    let stats = await (await fetch(statsUrl)).json() as any;
+    if (!stats) stats = { total_users: 0 };
+    const userId = (stats.total_users || 0) + 1;
+
+    // 2. Load Balancing (Round Robin)
+    let shardUrls: string[] = [];
+    try {
+        shardUrls = JSON.parse(this.env.SHARD_CONFIG);
+    } catch (e) {
+        shardUrls = []; // Fail safe
+    }
+    
+    // Default to Shard 0 if config fails
+    const shardIndex = userId % (shardUrls.length || 1);
+    
+    // 3. GENERATE SELF-DESCRIBING ID
+    // Format: "SHARD_INDEX.RANDOM_UUID"
+    // Example: "2.550e8400-e29b-41d4-a716-446655440000"
+    const uniquePart = crypto.randomUUID();
+    const analyticsId = `${shardIndex}.${uniquePart}`;
+
+    // 4. Update Main Shard (Async - Fire & Forget preferred in real prod)
+    // We still store the user in Main Shard for "Directory" purposes, but routing won't need it.
+    const userRecord = {
+      internal_id: userId,
+      shard_index: shardIndex,
+      created_at: Date.now()
+    };
+    
+    await fetch(`${this.env.MAIN_SHARD_URL}/identity_map/${uniquePart}.json`, {
+      method: 'PUT',
+      body: JSON.stringify(userRecord)
+    });
+
+    await fetch(statsUrl, {
+      method: 'PATCH',
+      body: JSON.stringify({ total_users: userId })
+    });
+
     return new Response(JSON.stringify({
-      user_id: lastId,
-      shard_id: logicalShardId,
+      analytics_id: analyticsId,
       metadata: { region: 'global' }
     }), { headers: { 'Content-Type': 'application/json' } });
   }
 }
 
-// --- ANALYTICS SESSION DO (State Ownership & Sharded Flushing) ---
+// --- DATA PLANE: ANALYTICS SESSION DO ---
 export class AnalyticsSession {
   state: DurableObjectState;
   env: Env;
-  locked: boolean = false;
-  user_guid: string | null = null;
+  
+  analyticsId: string | null = null;
+  assignedShardUrl: string | null = null;
+  shardConfig: string[] = [];
   buffer: any[] = [];
-  shardUrls: string[];
 
   constructor(state: DurableObjectState, env: Env) {
     this.state = state;
     this.env = env;
     
-    // Parse the Shard Config from Environment
+    // Load config once
     try {
-        this.shardUrls = JSON.parse(env.SHARD_CONFIG);
+      this.shardConfig = JSON.parse(env.SHARD_CONFIG);
     } catch (e) {
-        this.shardUrls = [];
-        console.error("Failed to parse SHARD_CONFIG");
+      console.error("Config Error");
     }
 
     this.state.blockConcurrencyWhile(async () => {
-        this.locked = (await this.state.storage.get<boolean>('locked')) || false;
-        this.user_guid = (await this.state.storage.get<string>('user_guid')) || null;
+        this.analyticsId = await this.state.storage.get<string>('analytics_id');
+        // We don't need to store assignedShardUrl anymore, we can derive it!
+        // But caching the full URL is still a nice micro-optimization.
     });
   }
 
   async fetch(request: Request): Promise<Response> {
     const url = new URL(request.url);
+    const body = await request.clone().json() as any;
+    const providedId = body.analytics_id;
 
-    if (url.pathname === '/connect') {
-      const { user_guid } = await request.json() as any;
-      if (this.locked && this.user_guid !== user_guid) {
-        return new Response('Identity Conflict', { status: 403 });
-      }
-      this.locked = true;
-      this.user_guid = user_guid;
-      await this.state.storage.put('locked', true);
-      await this.state.storage.put('user_guid', user_guid);
-      return new Response(JSON.stringify({ status: 'connected' }));
+    // 1. Resolve Routing INSTANTLY from ID
+    if (providedId && !this.analyticsId) {
+       this.analyticsId = providedId;
+       await this.state.storage.put('analytics_id', providedId);
     }
 
     if (url.pathname === '/track') {
-      if (!this.locked) return new Response('Not Connected', { status: 403 });
-      
-      const { events } = await request.json() as any;
+      const { events } = body;
       if (Array.isArray(events)) {
         this.buffer.push(...events);
       }
-
-      // Flush if buffer gets large enough
-      if (this.buffer.length >= 10) {
-        await this.flushToFirebase();
+      
+      // Flush logic
+      if (this.buffer.length >= 5) {
+        await this.flush();
       }
-
       return new Response(JSON.stringify({ queued: events.length }));
+    }
+
+    if (url.pathname === '/connect') {
+      return new Response(JSON.stringify({ status: 'connected' }));
     }
 
     return new Response('Not Found', { status: 404 });
   }
 
-  async flushToFirebase() {
-    if (this.buffer.length === 0 || !this.user_guid) return;
+  getShardUrl(): string | null {
+      if (!this.analyticsId) return null;
 
-    const data = [...this.buffer];
+      // PARSE THE ID: "2.550e..."
+      const parts = this.analyticsId.split('.');
+      if (parts.length < 2) return null; // Invalid format
+
+      const index = parseInt(parts[0]);
+      if (isNaN(index) || index >= this.shardConfig.length) return null;
+
+      return this.shardConfig[index];
+  }
+
+  async flush() {
+    const targetUrlRoot = this.getShardUrl();
+    if (this.buffer.length === 0 || !targetUrlRoot || !this.analyticsId) return;
+
+    const eventsPayload = [...this.buffer];
     this.buffer = [];
 
-    // 1. Determine the Shard URL
-    // We assume the DO name IS the user_id (set in index.ts)
-    const userId = parseInt(this.state.id.toString()) || 0; // Note: In real production, we pass ID via constructor or storage if name isn't numeric
-    // Better approach: We stored user_guid, let's assume user_guid IS the numeric ID for this math, 
-    // or we act based on the stored user_guid if it is numeric.
-    
-    // Fallback: If we can't parse an ID, we hash the GUID to pick a shard.
-    // Ideally, the system ensures user_guid is the monotonic ID from Registry.
-    let shardIndex = 0;
-    const parsedId = parseInt(this.user_guid);
-    
-    if (!isNaN(parsedId)) {
-        // User 1-1000 -> Index 0
-        // User 1001-2000 -> Index 1
-        shardIndex = Math.ceil(parsedId / 1000) - 1;
-    } else {
-        // Fallback for non-numeric GUIDs: Hash modulo
-        shardIndex = (this.user_guid.charCodeAt(0) % this.shardUrls.length);
-    }
-
-    // Safety: Wrap around if we run out of configured DBs
-    const finalShardIndex = shardIndex % this.shardUrls.length;
-    const dbUrl = this.shardUrls[finalShardIndex];
-
     const timestamp = Date.now();
-    const targetUrl = `${dbUrl}/raw_events/${this.user_guid}/${timestamp}.json`;
+    // Path: SHARD_URL / events / ANALYTICS_ID / TIMESTAMP.json
+    const targetUrl = `${targetUrlRoot}/events/${this.analyticsId}/${timestamp}.json`;
 
     try {
-      console.log(`Flushing to Shard ${finalShardIndex}: ${dbUrl}`);
       await fetch(targetUrl, {
         method: 'PUT',
-        body: JSON.stringify(data),
+        body: JSON.stringify(eventsPayload),
         headers: { 'Content-Type': 'application/json' }
       });
     } catch (e) {
-      console.error('Firebase Flush Failed', e);
+      console.error("Flush Failed", e);
     }
   }
 }
