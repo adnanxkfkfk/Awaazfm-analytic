@@ -3,7 +3,7 @@ import { AnalyticsSession, Registry } from './durable_object';
 export interface Env {
   ANALYTICS_SESSION: DurableObjectNamespace;
   REGISTRY: DurableObjectNamespace;
-  FIREBASE_RTDB_URL: string;
+  SHARD_CONFIG: string; // JSON String of URLs
 }
 
 export { AnalyticsSession, Registry };

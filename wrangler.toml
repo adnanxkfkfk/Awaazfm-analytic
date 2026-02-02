@@ -15,5 +15,13 @@ tag = "v1"
 new_classes = ["AnalyticsSession", "Registry"]
 
 [vars]
-FIREBASE_RTDB_URL = "https://comstorytv-default-rtdb.firebaseio.com"
+# We define multiple Realtime Database URLs here.
+# The system will automatically route users to the correct DB based on their ID.
+SHARD_CONFIG = """
+[
+  "https://comstorytv-default-rtdb.firebaseio.com",
+  "https://awaazfm-shard-2-default-rtdb.firebaseio.com",
+  "https://awaazfm-shard-3-default-rtdb.firebaseio.com"
+]
+"""
 TOTAL_SHARDS = "10"
