@@ -12,34 +12,37 @@ export class Registry {
 
   async fetch(request: Request): Promise<Response> {
     const statsUrl = `${this.env.MAIN_SHARD_URL}/system_stats.json`;
-    let stats = await (await fetch(statsUrl)).json() as any;
-    if (!stats) stats = { total_users: 0 };
-    const userId = (stats.total_users || 0) + 1;
-
+    
+    // Debug: Log the config we parsed
     let shardUrls: string[] = [];
     try {
         shardUrls = JSON.parse(this.env.SHARD_CONFIG);
     } catch (e) {
-        shardUrls = [];
+        return new Response(JSON.stringify({ error: "Config Parse Failed" }), { status: 500 });
     }
     
-    const shardIndex = userId % (shardUrls.length || 1);
+    // Fetch stats
+    let stats: any = {};
+    try {
+        stats = await (await fetch(statsUrl)).json() as any;
+    } catch (e) { /* ignore network error for now */ }
+
+    if (!stats) stats = { total_users: 0 };
+    const userId = (stats.total_users || 0) + 1;
     
-    // ID Format: "INDEX.UUID"
+    const shardIndex = userId % (shardUrls.length || 1);
     const uniquePart = crypto.randomUUID();
     const analyticsId = `${shardIndex}.${uniquePart}`;
+    const safeId = uniquePart;
 
-    // Update Main Shard
     const userRecord = {
       internal_id: userId,
       shard_index: shardIndex,
       created_at: Date.now()
     };
     
-    // Sanitize ID for Firebase Key (Replace . with _)
-    const safeId = uniquePart; // We index by the UUID part in the Main Shard map
-    
-    await fetch(`${this.env.MAIN_SHARD_URL}/identity_map/${safeId}.json`, {
+    // Write to Main Shard
+    const mapResult = await fetch(`${this.env.MAIN_SHARD_URL}/identity_map/${safeId}.json`, {
       method: 'PUT',
       body: JSON.stringify(userRecord)
     });
@@ -51,7 +54,8 @@ export class Registry {
 
     return new Response(JSON.stringify({
       analytics_id: analyticsId,
-      metadata: { region: 'global' }
+      debug_config_len: shardUrls.length,
+      debug_main_shard_status: mapResult.status
     }), { headers: { 'Content-Type': 'application/json' } });
   }
 }
@@ -93,10 +97,16 @@ export class AnalyticsSession {
         this.buffer.push(...events);
       }
       
-      if (this.buffer.length >= 5) {
-        await this.flush();
+      let flushDebug = null;
+      // Force flush if we have events, for debugging purposes
+      if (this.buffer.length >= 1) { 
+        flushDebug = await this.flush();
       }
-      return new Response(JSON.stringify({ queued: events.length }));
+      
+      return new Response(JSON.stringify({ 
+          queued: events.length,
+          debug_flush: flushDebug 
+      }));
     }
 
     if (url.pathname === '/connect') {
@@ -117,27 +127,37 @@ export class AnalyticsSession {
 
   async flush() {
     const targetUrlRoot = this.getShardUrl();
-    if (this.buffer.length === 0 || !targetUrlRoot || !this.analyticsId) return;
+    
+    // Debug info return
+    if (!this.analyticsId) return { error: "No Analytics ID" };
+    if (!targetUrlRoot) return { error: "No Shard URL Found", config_len: this.shardConfig.length, id: this.analyticsId };
+    if (this.buffer.length === 0) return { status: "Buffer Empty" };
 
     const eventsPayload = [...this.buffer];
-    this.buffer = [];
+    this.buffer = []; // Clear buffer BEFORE fetch to prevent duplicates if logic fails later, but for debug maybe keep if fail? No, standard is clear.
+
     const timestamp = Date.now();
-
-    // SANITIZATION FIX:
-    // Firebase Keys cannot have dots. We replace '.' with '_' for storage path.
     const safeAnalyticsId = this.analyticsId.replace(/\./g, '_');
-
-    // Path: SHARD_URL / events / SAFE_ANALYTICS_ID / TIMESTAMP.json
     const targetUrl = `${targetUrlRoot}/events/${safeAnalyticsId}/${timestamp}.json`;
 
     try {
-      await fetch(targetUrl, {
+      const response = await fetch(targetUrl, {
         method: 'PUT',
         body: JSON.stringify(eventsPayload),
         headers: { 'Content-Type': 'application/json' }
       });
-    } catch (e) {
-      console.error("Flush Failed", e);
+      
+      const responseText = await response.text();
+      
+      return {
+          status: response.status,
+          statusText: response.statusText,
+          url: targetUrl,
+          response_body: responseText
+      };
+
+    } catch (e: any) {
+      return { error: "Fetch Exception", details: e.message, url: targetUrl };
     }
   }
 }

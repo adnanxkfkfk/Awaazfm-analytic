@@ -18,11 +18,7 @@ new_sqlite_classes = ["AnalyticsSession", "Registry"]
 # MAIN SHARD (Control Plane)
 MAIN_SHARD_URL = "https://awaaz-anl-default-rtdb.asia-southeast1.firebasedatabase.app"
 
-# DATA SHARDS (Data Plane)
-SHARD_CONFIG = """
-[
-  "https://comstorytv-default-rtdb.firebaseio.com",
-  "https://awaaz-fm-default-rtdb.firebaseio.com"
-]
-"""
+# DATA SHARDS (Single line JSON to prevent parsing errors)
+SHARD_CONFIG = '["https://comstorytv-default-rtdb.firebaseio.com", "https://awaaz-fm-default-rtdb.firebaseio.com"]'
+
 TOTAL_SHARDS = "10"
