@@ -1,0 +1,19 @@
+name = "awaazfm-analytic"
+main = "src/index.ts"
+compatibility_date = "2024-02-02"
+
+[[durable_objects.bindings]]
+name = "ANALYTICS_SESSION"
+class_name = "AnalyticsSession"
+
+[[durable_objects.bindings]]
+name = "REGISTRY"
+class_name = "Registry"
+
+[[migrations]]
+tag = "v1"
+new_classes = ["AnalyticsSession", "Registry"]
+
+[vars]
+FIREBASE_RTDB_URL = "https://comstorytv-default-rtdb.firebaseio.com"
+TOTAL_SHARDS = "10"
