@@ -12,11 +12,9 @@ class_name = "Registry"
 
 [[migrations]]
 tag = "v1"
-new_classes = ["AnalyticsSession", "Registry"]
+new_sqlite_classes = ["AnalyticsSession", "Registry"]
 
 [vars]
-# We define multiple Realtime Database URLs here.
-# The system will automatically route users to the correct DB based on their ID.
 SHARD_CONFIG = """
 [
   "https://comstorytv-default-rtdb.firebaseio.com",
