@@ -31,6 +31,7 @@ export class Registry {
       created_at: Date.now()
     };
     
+    // Fire & Forget writes
     fetch(`${this.env.MAIN_SHARD_URL}/identity_map/${safeId}.json`, {
       method: 'PUT',
       body: JSON.stringify(userRecord)
@@ -47,15 +48,23 @@ export class Registry {
   }
 }
 
-// --- DATA PLANE: ANALYTICS SESSION DO (WebSocket Edition) ---
+// --- DATA PLANE: ANALYTICS SESSION DO ---
 export class AnalyticsSession {
   state: DurableObjectState;
   env: Env;
   
+  // Configuration & State
   analyticsId: string | null = null;
   shardConfig: string[] = [];
   buffer: any[] = [];
   sessions: WebSocket[] = [];
+  
+  // Session Lifecycle State
+  sessionId: string | null = null;
+  lastActive: number = 0;
+
+  // Constants
+  static SESSION_TIMEOUT_MS = 30 * 60 * 1000; // 30 Minutes
 
   constructor(state: DurableObjectState, env: Env) {
     this.state = state;
@@ -66,12 +75,15 @@ export class AnalyticsSession {
     
     this.state.blockConcurrencyWhile(async () => {
         this.analyticsId = await this.state.storage.get<string>('analytics_id');
+        this.sessionId = await this.state.storage.get<string>('session_id');
+        this.lastActive = await this.state.storage.get<number>('last_active') || 0;
     });
   }
 
   async fetch(request: Request): Promise<Response> {
     const url = new URL(request.url);
 
+    // WebSocket Endpoint
     if (url.pathname === '/analytics') {
       if (request.headers.get('Upgrade') !== 'websocket') {
         return new Response('Expected websocket', { status: 426 });
@@ -83,20 +95,35 @@ export class AnalyticsSession {
         await this.state.storage.put('analytics_id', providedId);
       }
 
-      // Create WebSocket Pair
       const { 0: client, 1: server } = new WebSocketPair();
       this.handleSession(server);
 
       return new Response(null, { status: 101, webSocket: client });
     }
 
+    // HTTP Endpoint (Fallback/Legacy)
+    if (url.pathname === '/track') {
+      const body = await request.clone().json() as any;
+      const { events, analytics_id } = body;
+
+      if (analytics_id && !this.analyticsId) {
+         this.analyticsId = analytics_id;
+         await this.state.storage.put('analytics_id', analytics_id);
+      }
+
+      if (Array.isArray(events)) {
+        await this.processEvents(events);
+      }
+      
+      return new Response(JSON.stringify({ queued: events.length }));
+    }
+
     return new Response('Not Found', { status: 404 });
   }
 
+  // Handle WebSocket Connection
   handleSession(webSocket: WebSocket) {
     this.sessions.push(webSocket);
-    
-    // Accept the connection
     webSocket.accept();
 
     webSocket.addEventListener('message', async (event) => {
@@ -105,31 +132,86 @@ export class AnalyticsSession {
         if (typeof raw !== 'string') return;
         const msg = JSON.parse(raw);
 
-        // Expecting { events: [...] } or single event object
-        // For simplicity: We expect { events: [...] }
+        // Expect { events: [...] }
         if (msg.events && Array.isArray(msg.events)) {
-            this.buffer.push(...msg.events);
-        } else {
-            // Treat whole message as one event if needed, or ignore
-            // ignoring malformed for now
+            await this.processEvents(msg.events);
         }
-
-        // Flush Threshold
-        if (this.buffer.length >= 5) {
-            await this.flush();
-        }
-
       } catch (err) {
-        // webSocket.send(JSON.stringify({ error: 'Parse Error' }));
+        // Ignore parse errors
       }
     });
 
     webSocket.addEventListener('close', async () => {
-      // Remove from session list
       this.sessions = this.sessions.filter(s => s !== webSocket);
-      // Flush on disconnect
+      // We do NOT end the session on socket close, because mobile connections flake.
+      // We rely on the Alarm Timeout to end the session.
       await this.flush();
     });
+  }
+
+  // Core Logic: Session Management + Event Enrichment
+  async processEvents(events: any[]) {
+      const now = Date.now();
+
+      // 1. Check if we need to START a new session
+      if (!this.sessionId || (now - this.lastActive > AnalyticsSession.SESSION_TIMEOUT_MS)) {
+          // If we had a stale session, flush it out first
+          if (this.buffer.length > 0) await this.flush();
+
+          this.sessionId = crypto.randomUUID();
+          
+          // Inject 'session_start' event
+          this.buffer.push({
+              type: 'session_start',
+              ts: now,
+              session_id: this.sessionId,
+              system: true
+          });
+      }
+
+      // 2. Update Activity Timers
+      this.lastActive = now;
+      await this.state.storage.put('last_active', this.lastActive);
+      await this.state.storage.put('session_id', this.sessionId);
+      
+      // 3. Reset Timeout Alarm (Extend session window)
+      await this.state.storage.setAlarm(now + AnalyticsSession.SESSION_TIMEOUT_MS);
+
+      // 4. Enrich & Buffer Incoming Events
+      for (const event of events) {
+          event.session_id = this.sessionId; // Auto-attach Session ID
+          if (!event.ts) event.ts = now;
+          this.buffer.push(event);
+      }
+
+      // 5. Flush if Threshold Reached
+      if (this.buffer.length >= 5) {
+          await this.flush();
+      }
+  }
+
+  // Cloudflare Alarm: Handles Auto-End on Timeout
+  async alarm() {
+      const now = Date.now();
+      
+      // If timed out
+      if (this.sessionId && (now - this.lastActive >= AnalyticsSession.SESSION_TIMEOUT_MS)) {
+          // Log 'session_end'
+          this.buffer.push({
+              type: 'session_end',
+              ts: now,
+              session_id: this.sessionId,
+              system: true,
+              reason: 'timeout'
+          });
+
+          // Reset Session State
+          this.sessionId = null;
+          await this.state.storage.delete('session_id');
+          
+          // Final Flush
+          await this.flush();
+      }
   }
 
   getShardUrl(): string | null {
@@ -158,10 +240,8 @@ export class AnalyticsSession {
         body: JSON.stringify(eventsPayload),
         headers: { 'Content-Type': 'application/json' }
       });
-      // Optional: Ack to client?
     } catch (e) {
       console.error("Flush Failed", e);
-      // Put back in buffer? Or drop. Dropping to prevent memory leaks in DO.
     }
   }
 }
